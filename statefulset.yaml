@@ -1,0 +1,111 @@
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: percona
+  namespace: galera
+spec:
+  serviceName: "percona"
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: percona
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: percona
+        image: objectiflibre/percona-galera:5.7
+        imagePullPolicy: Always
+        args: ['--ignore-db-dir=lost+found']
+        env:
+        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+          value: "1"
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: percona
+          mountPath: /var/lib/mysql
+        - name: percona-conf
+          mountPath: /etc/mysql/percona-xtradb-cluster.conf.d/
+        readinessProbe:
+          exec:
+            command: ["mysql", "-h", "127.0.0.1", "-e", "SELECT 1"]
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+      - name: xtrabackup
+        image: objectiflibre/percona-galera:5.7
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3307
+          name: mysql
+        volumeMounts:
+        - name: percona
+          mountPath: /var/lib/mysql
+        - name: percona-conf
+          mountPath: /etc/mysql/percona-xtradb-cluster.conf.d/
+        command:
+          - "/bin/bash"
+          - "-c"
+          - |
+            echo "Waiting for mysqld to be ready (accepting connections)"
+            until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 10; done
+            exec nc -l -p 3307 -c 'xtrabackup --backup --galera-info --stream=xbstream --host=127.0.0.1 --user=root'
+      volumes:
+      - name: percona-conf
+        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: percona
+      initContainers:
+      - name: percona-init
+        image: objectiflibre/percona-galera:5.7
+        imagePullPolicy: Always
+        command:
+          - "/bin/bash"
+          - "-c"
+          - |
+            [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+            ordinal=${BASH_REMATCH[1]}
+            echo [mysqld] > /etc/mysql/percona-xtradb-cluster.conf.d/server-id.cnf
+            echo server-id=$((100 + $ordinal)) >> /etc/mysql/percona-xtradb-cluster.conf.d/server-id.cnf
+            echo wsrep_node_address=`hostname --ip-address` >> /etc/mysql/percona-xtradb-cluster.conf.d/server-id.cnf
+            cp /tmp/config/* /etc/mysql/percona-xtradb-cluster.conf.d/
+            [[ -d /var/lib/mysql/mysql ]] && exit 0
+            [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+            ordinal=${BASH_REMATCH[1]}
+            [[ $ordinal -eq 0 ]] && sed -i 's#wsrep_cluster_address = gcomm.*#wsrep_cluster_address = gcomm://#g' /etc/mysql/percona-xtradb-cluster.conf.d/wsrep.cnf
+            [[ $ordinal -eq 0 ]] && exit 0
+            #while ! timeout 1 bash -c 'cat < /dev/null > /dev/tcp/percona-'$(($ordinal-1))'/3306'; do sleep 20; done
+            nc percona-$(($ordinal-1)).percona 3307 | xbstream -x -C /var/lib/mysql
+            xtrabackup --prepare --target-dir=/var/lib/mysql
+            cat <<EOF > /var/lib/mysql/grastate.dat
+            version: 2.1
+            uuid: $(cut -d: -f1 /var/lib/mysql/xtrabackup_galera_info)
+            seqno: $(cut -d: -f2 /var/lib/mysql/xtrabackup_galera_info)
+            cert_index:
+            EOF
+            chown -R mysql: /var/lib/mysql
+        volumeMounts:
+        - name: percona-conf
+          mountPath: /etc/mysql/percona-xtradb-cluster.conf.d/
+        - name: percona
+          mountPath: /var/lib/mysql
+        - name: config-map
+          mountPath: /tmp/config
+      volumes:
+      - name: percona-conf
+        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: percona
+  volumeClaimTemplates:
+  - metadata:
+      name: percona
+      annotations:
+        volume.beta.kubernetes.io/storage-class: standard
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
